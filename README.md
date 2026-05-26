@@ -1,4 +1,4 @@
-## agdb Áttekintés
+## Áttekintés
 
 az agdb egy nagy teljesítményű, Zig nyelven írt, perzisztens adatbázis-motor, amelyet hibrid keresésre (teljes szöveges és vektoros), többszemélyes használatra és alacsony késleltetésű műveletekre terveztek. Egyéni tartós halom, write-ahead logging (WAL) és egy robusztus, felhő-képes architektúra jellemzi, amely támogatja a sandboxolt tenant izolációt.
 
