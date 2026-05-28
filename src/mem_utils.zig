@@ -1,3 +1,4 @@
+```zig
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -83,7 +84,7 @@ pub const Arena = struct {
     pub fn init(allocator: Allocator, size: usize) !Arena {
         if (size == 0) return error.InvalidSize;
         const aligned_size = mem.alignForward(usize, size, PageSize);
-        const buffer = try allocator.alignedAlloc(u8, PageSize, aligned_size);
+        const buffer = try allocator.alignedAlloc(u8, Alignment.fromByteUnits(PageSize), aligned_size);
         return .{
             .buffer = buffer,
             .offset = 0,
@@ -207,6 +208,7 @@ pub const ArenaAllocator = struct {
         };
         self.current_buffer = new_buf;
         self.pos = 0;
+        return {};
     }
 
     fn alignedPos(self: *ArenaAllocator, alignment: usize) ?usize {
@@ -342,7 +344,7 @@ pub const SlabAllocator = struct {
         if (block_size == 0 or !isPow2(block_size)) return error.InvalidBlockSize;
         if (slab_size < block_size or slab_size % block_size != 0) return error.InvalidSize;
 
-        var slabs = try parent_allocator.alloc(Slab, num_slabs);
+        const slabs = try parent_allocator.alloc(Slab, num_slabs);
         var initialized: usize = 0;
         errdefer {
             var i: usize = 0;
@@ -552,7 +554,7 @@ pub const PoolAllocator = struct {
         if (num_pools == 0) return error.InvalidPoolCount;
 
         const actual_block_size = mem.alignForward(usize, @max(block_size, @sizeOf(?usize)), @alignOf(?usize));
-        var pools = try parent_allocator.alloc(Pool, num_pools);
+        const pools = try parent_allocator.alloc(Pool, num_pools);
         var initialized: usize = 0;
         errdefer {
             var i: usize = 0;
@@ -564,7 +566,7 @@ pub const PoolAllocator = struct {
 
         while (initialized < num_pools) : (initialized += 1) {
             const total = try mulChecked(actual_block_size, num_blocks);
-            pools[initialized].buffer = try parent_allocator.alignedAlloc(u8, @alignOf(?usize), total);
+            pools[initialized].buffer = try parent_allocator.alignedAlloc(u8, Alignment.fromByteUnits(@alignOf(?usize)), total);
             @memset(pools[initialized].buffer, 0);
             pools[initialized].block_size = actual_block_size;
             pools[initialized].num_blocks = num_blocks;
@@ -732,7 +734,7 @@ pub const BuddyAllocator = struct {
         @memset(tree, .free);
         errdefer parent_allocator.free(tree);
 
-        const memory = try parent_allocator.alignedAlloc(u8, PageSize, capacity);
+        const memory = try parent_allocator.alignedAlloc(u8, Alignment.fromByteUnits(PageSize), capacity);
         errdefer parent_allocator.free(memory);
 
         return .{
@@ -1177,7 +1179,7 @@ pub const PageAllocator = struct {
     pub fn init(allocator: Allocator, num_pages: usize) !PageAllocator {
         if (num_pages == 0) return error.InvalidSize;
         const total = try mulChecked(num_pages, PageSize);
-        const pages = try allocator.alignedAlloc(u8, PageSize, total);
+        const pages = try allocator.alignedAlloc(u8, Alignment.fromByteUnits(PageSize), total);
         const bitmap_words = (num_pages + 63) / 64;
         const bitmap = try allocator.alloc(u64, bitmap_words);
         @memset(bitmap, 0);
