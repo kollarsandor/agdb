@@ -43,9 +43,18 @@ fn isPow2(x: usize) bool {
     return x != 0 and (x & (x - 1)) == 0;
 }
 
+fn alignForwardUnchecked(addr: usize, alignment: usize) usize {
+    return (addr + alignment - 1) & ~(alignment - 1);
+}
+
+fn alignBackwardUnchecked(addr: usize, alignment: usize) usize {
+    return addr & ~(alignment - 1);
+}
+
 fn alignForwardChecked(addr: usize, alignment: usize) ArithmeticError!usize {
     if (!isPow2(alignment)) return error.InvalidAlignment;
-    return mem.alignForward(usize, addr, alignment);
+    const adjusted = try addChecked(addr, alignment - 1);
+    return adjusted & ~(alignment - 1);
 }
 
 fn addChecked(a: usize, b: usize) ArithmeticError!usize {
@@ -64,12 +73,28 @@ fn saturatingSub(a: usize, b: usize) usize {
     return if (a >= b) a - b else 0;
 }
 
+fn allocAlignedU8(allocator: Allocator, len: usize, comptime alignment: usize) ![]align(alignment) u8 {
+    if (!isPow2(alignment)) return error.InvalidAlignment;
+    if (len == 0) {
+        const p: [*]align(alignment) u8 = @ptrFromInt(alignment);
+        return p[0..0];
+    }
+    const raw = allocator.rawAlloc(len, Alignment.fromByteUnits(alignment), @returnAddress()) orelse return error.OutOfMemory;
+    const p: [*]align(alignment) u8 = @ptrCast(@alignCast(raw));
+    return p[0..len];
+}
+
 fn runtimeAlignedAlloc(allocator: Allocator, comptime T: type, n: usize, alignment: usize) ![]T {
     if (!isPow2(alignment)) return error.InvalidAlignment;
     if (n == 0) return emptySlice(T);
+    if (@sizeOf(T) == 0) {
+        const addr: usize = @max(@alignOf(T), alignment);
+        const p: [*]T = @ptrFromInt(addr);
+        return p[0..n];
+    }
     const byte_count = try mulChecked(n, @sizeOf(T));
-    const a = Alignment.fromByteUnits(alignment);
-    const raw = allocator.rawAlloc(byte_count, a, @returnAddress()) orelse return error.OutOfMemory;
+    const effective_alignment = @max(alignment, @alignOf(T));
+    const raw = allocator.rawAlloc(byte_count, Alignment.fromByteUnits(effective_alignment), @returnAddress()) orelse return error.OutOfMemory;
     const typed: [*]T = @ptrCast(@alignCast(raw));
     return typed[0..n];
 }
@@ -82,8 +107,8 @@ pub const Arena = struct {
 
     pub fn init(allocator: Allocator, size: usize) !Arena {
         if (size == 0) return error.InvalidSize;
-        const aligned_size = mem.alignForward(usize, size, PageSize);
-        const buffer = try allocator.alignedAlloc(u8, Alignment.fromByteUnits(PageSize), aligned_size);
+        const aligned_size = try alignForwardChecked(size, PageSize);
+        const buffer = try allocAlignedU8(allocator, aligned_size, PageSize);
         return .{
             .buffer = buffer,
             .offset = 0,
@@ -107,7 +132,7 @@ pub const Arena = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const aligned_offset = mem.alignForward(usize, self.offset, alignment);
+        const aligned_offset = alignForwardChecked(self.offset, alignment) catch return null;
         const end = addChecked(aligned_offset, size) catch return null;
         if (end > self.buffer.len) return null;
 
@@ -164,7 +189,7 @@ pub const ArenaAllocator = struct {
     pub fn init(parent_allocator: Allocator, buffer_size: usize) ArenaAllocator {
         return .{
             .parent_allocator = parent_allocator,
-            .buffers = .empty,
+            .buffers = .{},
             .current_buffer = emptyU8Slice(),
             .pos = 0,
             .buffer_size = if (buffer_size == 0) 4096 else buffer_size,
@@ -213,7 +238,7 @@ pub const ArenaAllocator = struct {
     fn alignedPos(self: *ArenaAllocator, alignment: usize) ?usize {
         const base = @intFromPtr(self.current_buffer.ptr);
         const cur = addChecked(base, self.pos) catch return null;
-        const aligned = mem.alignForward(usize, cur, alignment);
+        const aligned = alignForwardChecked(cur, alignment) catch return null;
         return aligned - base;
     }
 
@@ -256,8 +281,7 @@ pub const ArenaAllocator = struct {
         if (self.current_buffer.len == 0) return false;
         const base = @intFromPtr(self.current_buffer.ptr);
         const buf_addr = @intFromPtr(buf.ptr);
-        const expected_addr = mem.alignForward(usize, buf_addr, align_bytes);
-        if (expected_addr != buf_addr) return false;
+        if (!isAligned(buf_addr, align_bytes)) return false;
         const buf_end = addChecked(buf_addr, buf.len) catch return false;
         const cur_end = addChecked(base, self.pos) catch return false;
         if (buf_end != cur_end) return false;
@@ -405,7 +429,7 @@ pub const SlabAllocator = struct {
         var search_count: usize = 0;
         while (search_count < self.slabs.len) : (search_count += 1) {
             const slab_idx = (self.next_id + search_count) % self.slabs.len;
-            var slab = &self.slabs[slab_idx];
+            const slab = &self.slabs[slab_idx];
             var consecutive: usize = 0;
             var start_idx: usize = 0;
 
@@ -458,7 +482,10 @@ pub const SlabAllocator = struct {
         const align_bytes = alignment.toByteUnits();
         if (align_bytes > self.block_size) return null;
         const slice = self.alloc(len) orelse return null;
-        if (!mem.isAligned(@intFromPtr(slice.ptr), align_bytes)) return null;
+        if (!isAligned(@intFromPtr(slice.ptr), align_bytes)) {
+            self.free(slice) catch {};
+            return null;
+        }
         return slice.ptr;
     }
 
@@ -493,10 +520,11 @@ pub const SlabAllocator = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const entry = self.allocations.fetchRemove(@intFromPtr(ptr.ptr)) orelse return error.InvalidPointer;
-        const meta = entry.value;
-        var slab = &self.slabs[meta.slab_index];
+        const entry = self.allocations.getEntry(@intFromPtr(ptr.ptr)) orelse return error.InvalidPointer;
+        const meta = entry.value_ptr.*;
         if (ptr.len != meta.size) return error.InvalidPointer;
+        _ = self.allocations.remove(@intFromPtr(ptr.ptr));
+        const slab = &self.slabs[meta.slab_index];
         slab.setRange(meta.start_block, meta.blocks, false);
         const offset = meta.start_block * self.block_size;
         secureZeroMemory(slab.data.ptr + offset, meta.size);
@@ -552,7 +580,7 @@ pub const PoolAllocator = struct {
         if (num_blocks == 0) return error.InvalidBlockCount;
         if (num_pools == 0) return error.InvalidPoolCount;
 
-        const actual_block_size = mem.alignForward(usize, @max(block_size, @sizeOf(?usize)), @alignOf(?usize));
+        const actual_block_size = try alignForwardChecked(@max(block_size, @sizeOf(?usize)), @alignOf(?usize));
         const pools = try parent_allocator.alloc(Pool, num_pools);
         var initialized: usize = 0;
         errdefer {
@@ -565,7 +593,7 @@ pub const PoolAllocator = struct {
 
         while (initialized < num_pools) : (initialized += 1) {
             const total = try mulChecked(actual_block_size, num_blocks);
-            pools[initialized].buffer = try parent_allocator.alignedAlloc(u8, Alignment.fromByteUnits(@alignOf(?usize)), total);
+            pools[initialized].buffer = try allocAlignedU8(parent_allocator, total, @alignOf(?usize));
             @memset(pools[initialized].buffer, 0);
             pools[initialized].block_size = actual_block_size;
             pools[initialized].num_blocks = num_blocks;
@@ -647,7 +675,10 @@ pub const PoolAllocator = struct {
         const align_bytes = alignment.toByteUnits();
         if (align_bytes > @alignOf(?usize)) return null;
         const slice = self.alloc(len) orelse return null;
-        if (!mem.isAligned(@intFromPtr(slice.ptr), align_bytes)) return null;
+        if (!isAligned(@intFromPtr(slice.ptr), align_bytes)) {
+            self.free(slice) catch {};
+            return null;
+        }
         return slice.ptr;
     }
 
@@ -682,10 +713,11 @@ pub const PoolAllocator = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const removed = self.allocations.fetchRemove(@intFromPtr(ptr.ptr)) orelse return error.InvalidPointer;
-        const meta = removed.value;
-        var pool = &self.pools[meta.pool_index];
-        if (ptr.len != meta.size or pool.used == 0) return error.DoubleFree;
+        const entry = self.allocations.getEntry(@intFromPtr(ptr.ptr)) orelse return error.InvalidPointer;
+        const meta = entry.value_ptr.*;
+        const pool = &self.pools[meta.pool_index];
+        if (ptr.len != meta.size or pool.used == 0) return error.InvalidPointer;
+        _ = self.allocations.remove(@intFromPtr(ptr.ptr));
 
         const full = pool.buffer[meta.block_index * pool.block_size .. (meta.block_index + 1) * pool.block_size];
         secureZeroMemory(full.ptr, full.len);
@@ -708,6 +740,7 @@ pub const BuddyAllocator = struct {
     const AllocationMeta = struct {
         order: u32,
         size: usize,
+        offset: usize,
     };
 
     const State = enum(u8) {
@@ -733,7 +766,7 @@ pub const BuddyAllocator = struct {
         @memset(tree, .free);
         errdefer parent_allocator.free(tree);
 
-        const memory = try parent_allocator.alignedAlloc(u8, Alignment.fromByteUnits(PageSize), capacity);
+        const memory = try allocAlignedU8(parent_allocator, capacity, PageSize);
         errdefer parent_allocator.free(memory);
 
         return .{
@@ -835,14 +868,12 @@ pub const BuddyAllocator = struct {
         return null;
     }
 
-    fn ptrFromIndex(self: *BuddyAllocator, idx: usize, order: u32) []align(PageSize) u8 {
+    fn byteOffsetFromIndex(self: *BuddyAllocator, idx: usize, order: u32) usize {
         const level = self.max_order - order;
         const start = levelStart(level);
         const offset_in_level = idx - start;
         const block_size = @as(usize, 1) << @intCast(order);
-        const byte_offset = offset_in_level * block_size;
-        const p: [*]align(PageSize) u8 = @alignCast(self.memory.ptr + byte_offset);
-        return p[0..block_size];
+        return offset_in_level * block_size;
     }
 
     fn freeIndex(self: *BuddyAllocator, idx: usize, order: u32) void {
@@ -860,6 +891,7 @@ pub const BuddyAllocator = struct {
     fn allocAlignedInternal(self: *BuddyAllocator, size: usize, alignment: usize) ![]u8 {
         if (size == 0) return error.InvalidSize;
         if (!isPow2(alignment)) return error.InvalidAlignment;
+        if (alignment > PageSize) return error.InvalidAlignment;
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -872,9 +904,18 @@ pub const BuddyAllocator = struct {
         if (want_order > self.max_order) return error.OutOfMemory;
 
         const found = self.allocRec(0, self.max_order, want_order) orelse return error.OutOfMemory;
-        const block = self.ptrFromIndex(found, want_order);
+        const byte_offset = self.byteOffsetFromIndex(found, want_order);
+        const block_size = @as(usize, 1) << @intCast(want_order);
+        const base = @intFromPtr(self.memory.ptr);
+        const block_addr = base + byte_offset;
+        if (!isAligned(block_addr, alignment)) {
+            self.freeIndex(found, want_order);
+            return error.InvalidAlignment;
+        }
+        const block_ptr: [*]u8 = self.memory.ptr + byte_offset;
+        const block = block_ptr[0..block_size];
         const out = block[0..size];
-        self.size_map.put(@intFromPtr(out.ptr), .{ .order = want_order, .size = size }) catch {
+        self.size_map.put(@intFromPtr(out.ptr), .{ .order = want_order, .size = size, .offset = byte_offset }) catch {
             self.freeIndex(found, want_order);
             return error.OutOfMemory;
         };
@@ -898,6 +939,7 @@ pub const BuddyAllocator = struct {
         _ = ret_addr;
         const self: *BuddyAllocator = @ptrCast(@alignCast(ctx));
         const align_bytes = alignment.toByteUnits();
+        if (align_bytes > PageSize) return null;
         const slice = self.allocAlignedInternal(len, align_bytes) catch return null;
         return slice.ptr;
     }
@@ -937,18 +979,21 @@ pub const BuddyAllocator = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const removed = self.size_map.fetchRemove(@intFromPtr(ptr.ptr)) orelse return error.InvalidPointer;
-        const meta = removed.value;
+        const entry = self.size_map.getEntry(@intFromPtr(ptr.ptr)) orelse return error.InvalidPointer;
+        const meta = entry.value_ptr.*;
         if (ptr.len != meta.size) return error.InvalidPointer;
 
         const ptr_addr = @intFromPtr(ptr.ptr);
         const base = @intFromPtr(self.memory.ptr);
-        if (ptr_addr < base or ptr_addr >= base + self.memory.len) return error.InvalidPointer;
+        const memory_end = try addChecked(base, self.memory.len);
+        if (ptr_addr < base or ptr_addr >= memory_end) return error.InvalidPointer;
 
         const block_size = @as(usize, 1) << @intCast(meta.order);
         const offset = ptr_addr - base;
+        if (offset != meta.offset) return error.InvalidPointer;
         if (offset % block_size != 0) return error.InvalidPointer;
 
+        _ = self.size_map.remove(@intFromPtr(ptr.ptr));
         const level = self.max_order - meta.order;
         const start = levelStart(level);
         const offset_in_level = offset / block_size;
@@ -1017,17 +1062,28 @@ pub const LockFreeQueue = struct {
     head: usize,
     tail: usize,
     mask: usize,
+    capacity: usize,
+    sequences: []usize,
     buffer: []usize,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, capacity: usize) !LockFreeQueue {
         if (capacity < 2 or !isPow2(capacity)) return error.InvalidSize;
         const buffer = try allocator.alloc(usize, capacity);
+        errdefer allocator.free(buffer);
         @memset(buffer, 0);
+        const sequences = try allocator.alloc(usize, capacity);
+        @memset(sequences, 0);
+        var i: usize = 0;
+        while (i < capacity) : (i += 1) {
+            @atomicStore(usize, &sequences[i], i, .monotonic);
+        }
         return .{
             .head = 0,
             .tail = 0,
             .mask = capacity - 1,
+            .capacity = capacity,
+            .sequences = sequences,
             .buffer = buffer,
             .allocator = allocator,
         };
@@ -1035,36 +1091,54 @@ pub const LockFreeQueue = struct {
 
     pub fn deinit(self: *LockFreeQueue) void {
         const buf = self.buffer;
+        const seq = self.sequences;
         self.buffer = emptySlice(usize);
+        self.sequences = emptySlice(usize);
         self.head = 0;
         self.tail = 0;
         self.mask = 0;
+        self.capacity = 0;
         if (buf.len != 0) self.allocator.free(buf);
+        if (seq.len != 0) self.allocator.free(seq);
     }
 
     pub fn enqueue(self: *LockFreeQueue, item: *anyopaque) bool {
+        var pos = @atomicLoad(usize, &self.tail, .monotonic);
         while (true) {
-            const tail = @atomicLoad(usize, &self.tail, .acquire);
-            const head = @atomicLoad(usize, &self.head, .acquire);
-            const next_tail = (tail + 1) & self.mask;
-            if (next_tail == head) return false;
-            self.buffer[tail] = @intFromPtr(item);
-            if (@cmpxchgWeak(usize, &self.tail, tail, next_tail, .acq_rel, .acquire) == null) {
-                return true;
+            const index = pos & self.mask;
+            const seq = @atomicLoad(usize, &self.sequences[index], .acquire);
+            const diff = @as(isize, @bitCast(seq)) - @as(isize, @bitCast(pos));
+            if (diff == 0) {
+                if (@cmpxchgWeak(usize, &self.tail, pos, pos + 1, .monotonic, .monotonic) == null) {
+                    self.buffer[index] = @intFromPtr(item);
+                    @atomicStore(usize, &self.sequences[index], pos + 1, .release);
+                    return true;
+                }
+            } else if (diff < 0) {
+                return false;
+            } else {
+                pos = @atomicLoad(usize, &self.tail, .monotonic);
             }
         }
     }
 
     pub fn dequeue(self: *LockFreeQueue) ?*anyopaque {
+        var pos = @atomicLoad(usize, &self.head, .monotonic);
         while (true) {
-            const head = @atomicLoad(usize, &self.head, .acquire);
-            const tail = @atomicLoad(usize, &self.tail, .acquire);
-            if (head == tail) return null;
-            const value = self.buffer[head];
-            const next_head = (head + 1) & self.mask;
-            if (@cmpxchgWeak(usize, &self.head, head, next_head, .acq_rel, .acquire) == null) {
-                self.buffer[head] = 0;
-                return @ptrFromInt(value);
+            const index = pos & self.mask;
+            const seq = @atomicLoad(usize, &self.sequences[index], .acquire);
+            const diff = @as(isize, @bitCast(seq)) - @as(isize, @bitCast(pos + 1));
+            if (diff == 0) {
+                if (@cmpxchgWeak(usize, &self.head, pos, pos + 1, .monotonic, .monotonic) == null) {
+                    const value = self.buffer[index];
+                    self.buffer[index] = 0;
+                    @atomicStore(usize, &self.sequences[index], pos + self.capacity, .release);
+                    return @ptrFromInt(value);
+                }
+            } else if (diff < 0) {
+                return null;
+            } else {
+                pos = @atomicLoad(usize, &self.head, .monotonic);
             }
         }
     }
@@ -1123,21 +1197,36 @@ pub const MutexStack = struct {
 };
 
 pub const LockFreeStack = struct {
-    top: usize,
+    head: u128,
     allocator: Allocator,
+    mutex: Mutex,
 
     const Node = struct {
         value: *anyopaque,
         next: usize,
     };
 
+    fn packHead(ptr: usize, counter: u64) u128 {
+        return (@as(u128, counter) << 64) | @as(u128, ptr);
+    }
+
+    fn headPtr(value: u128) usize {
+        return @truncate(value);
+    }
+
+    fn headCounter(value: u128) u64 {
+        return @truncate(value >> 64);
+    }
+
     pub fn init(allocator: Allocator) LockFreeStack {
-        return .{ .top = 0, .allocator = allocator };
+        return .{ .head = 0, .allocator = allocator, .mutex = .{} };
     }
 
     pub fn deinit(self: *LockFreeStack) void {
-        var cur = @atomicLoad(usize, &self.top, .acquire);
-        @atomicStore(usize, &self.top, 0, .release);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var cur = headPtr(@atomicLoad(u128, &self.head, .acquire));
+        @atomicStore(u128, &self.head, 0, .release);
         while (cur != 0) {
             const node: *Node = @ptrFromInt(cur);
             cur = node.next;
@@ -1147,19 +1236,23 @@ pub const LockFreeStack = struct {
 
     pub fn push(self: *LockFreeStack, value: *anyopaque) !void {
         const node = try self.allocator.create(Node);
+        node.value = value;
         while (true) {
-            const old = @atomicLoad(usize, &self.top, .acquire);
-            node.* = .{ .value = value, .next = old };
-            if (@cmpxchgWeak(usize, &self.top, old, @intFromPtr(node), .acq_rel, .acquire) == null) return;
+            const old = @atomicLoad(u128, &self.head, .acquire);
+            node.next = headPtr(old);
+            const new_head = packHead(@intFromPtr(node), headCounter(old) +% 1);
+            if (@cmpxchgWeak(u128, &self.head, old, new_head, .acq_rel, .acquire) == null) return;
         }
     }
 
     pub fn pop(self: *LockFreeStack) ?*anyopaque {
         while (true) {
-            const old = @atomicLoad(usize, &self.top, .acquire);
-            if (old == 0) return null;
-            const node: *Node = @ptrFromInt(old);
-            if (@cmpxchgWeak(usize, &self.top, old, node.next, .acq_rel, .acquire) == null) {
+            const old = @atomicLoad(u128, &self.head, .acquire);
+            const old_ptr = headPtr(old);
+            if (old_ptr == 0) return null;
+            const node: *Node = @ptrFromInt(old_ptr);
+            const new_head = packHead(node.next, headCounter(old) +% 1);
+            if (@cmpxchgWeak(u128, &self.head, old, new_head, .acq_rel, .acquire) == null) {
                 const value = node.value;
                 self.allocator.destroy(node);
                 return value;
@@ -1178,7 +1271,8 @@ pub const PageAllocator = struct {
     pub fn init(allocator: Allocator, num_pages: usize) !PageAllocator {
         if (num_pages == 0) return error.InvalidSize;
         const total = try mulChecked(num_pages, PageSize);
-        const pages = try allocator.alignedAlloc(u8, Alignment.fromByteUnits(PageSize), total);
+        const pages = try allocAlignedU8(allocator, total, PageSize);
+        errdefer allocator.free(pages);
         const bitmap_words = (num_pages + 63) / 64;
         const bitmap = try allocator.alloc(u64, bitmap_words);
         @memset(bitmap, 0);
@@ -1261,7 +1355,7 @@ pub const PageAllocator = struct {
         defer self.mutex.unlock();
 
         const pages_start = @intFromPtr(self.pages.ptr);
-        const pages_end = pages_start + self.pages.len;
+        const pages_end = try addChecked(pages_start, self.pages.len);
         const ptr_addr = @intFromPtr(ptr.ptr);
         if (ptr_addr < pages_start or ptr_addr >= pages_end) return error.InvalidPointer;
         const offset = ptr_addr - pages_start;
@@ -1405,8 +1499,7 @@ pub fn secureZeroMemory(ptr: [*]u8, size: usize) void {
     const p: [*]volatile u8 = @ptrCast(ptr);
     var i: usize = 0;
     while (i < size) : (i += 1) p[i] = 0;
-    var sink: u8 = 0;
-    @atomicStore(u8, &sink, 0, .seq_cst);
+    @fence(.seq_cst);
 }
 
 pub fn constantTimeCompare(a: []const u8, b: []const u8) bool {
@@ -1437,30 +1530,27 @@ pub fn alignForward(addr: usize, alignment: usize) !usize {
 
 pub fn alignBackward(addr: usize, alignment: usize) !usize {
     if (!isPow2(alignment)) return error.InvalidAlignment;
-    return mem.alignBackward(usize, addr, alignment);
+    return alignBackwardUnchecked(addr, alignment);
 }
 
 pub fn isAligned(addr: usize, alignment: usize) bool {
-    return mem.isAligned(addr, alignment);
+    return isPow2(alignment) and (addr & (alignment - 1)) == 0;
 }
 
 pub fn pageAlignedSize(size: usize) usize {
-    return mem.alignForward(usize, size, PageSize);
+    return alignForwardChecked(size, PageSize) catch std.math.maxInt(usize);
 }
 
 pub fn memoryBarrier() void {
-    var dummy: u8 = 0;
-    _ = @atomicRmw(u8, &dummy, .Or, 0, .seq_cst);
+    @fence(.seq_cst);
 }
 
 pub fn readMemoryFence() void {
-    var dummy: u8 = 0;
-    _ = @atomicLoad(u8, &dummy, .acquire);
+    @fence(.acquire);
 }
 
 pub fn writeMemoryFence() void {
-    var dummy: u8 = 0;
-    @atomicStore(u8, &dummy, 0, .release);
+    @fence(.release);
 }
 
 pub fn compareExchangeMemory(ptr: *u64, expected: u64, desired: u64) bool {
@@ -1517,8 +1607,7 @@ pub fn secureErase(ptr: [*]u8, size: usize) void {
     while (i < size) : (i += 1) p[i] = 0xAA;
     i = 0;
     while (i < size) : (i += 1) p[i] = 0x00;
-    var sink: u8 = 0;
-    @atomicStore(u8, &sink, 0, .seq_cst);
+    @fence(.seq_cst);
 }
 
 pub fn duplicateMemory(allocator: Allocator, data: []const u8) ![]u8 {
@@ -1553,7 +1642,8 @@ pub fn reverseMemory(data: []u8) void {
 }
 
 pub fn rotateMemory(data: []u8, shift: usize) void {
-    mem.rotate(u8, data, shift);
+    if (data.len == 0) return;
+    mem.rotate(u8, data, shift % data.len);
 }
 
 pub fn countMemory(data: []const u8, value: u8) usize {
@@ -1889,7 +1979,7 @@ pub fn memoryPatternVerify(ptr: [*]const u8, size: usize, pattern: []const u8) !
 pub fn virtualMemoryMap(addr: ?*anyopaque, size: usize, prot: u32, flags: u32) !*anyopaque {
     if (builtin.os.tag == .windows) return error.Unsupported;
     if (size == 0) return error.InvalidSize;
-    const hint: ?[*]align(PageSize) u8 = if (addr) |a| @ptrFromInt(mem.alignBackward(usize, @intFromPtr(a), PageSize)) else null;
+    const hint: ?[*]align(PageSize) u8 = if (addr) |a| @ptrFromInt(alignBackwardUnchecked(@intFromPtr(a), PageSize)) else null;
     const map_flags: std.posix.system.MAP = @bitCast(flags);
     const mapped = try std.posix.mmap(hint, size, prot, map_flags, -1, 0);
     return @ptrCast(mapped.ptr);
@@ -1899,10 +1989,10 @@ pub fn virtualMemoryUnmap(addr: *anyopaque, size: usize) !void {
     if (builtin.os.tag == .windows) return error.Unsupported;
     if (size == 0) return;
     const base_addr = @intFromPtr(addr);
-    const aligned_addr = mem.alignBackward(usize, base_addr, PageSize);
+    const aligned_addr = alignBackwardUnchecked(base_addr, PageSize);
     const delta = base_addr - aligned_addr;
     const span = try addChecked(size, delta);
-    const aligned_size = mem.alignForward(usize, span, PageSize);
+    const aligned_size = try alignForwardChecked(span, PageSize);
     const p: [*]align(PageSize) u8 = @ptrFromInt(aligned_addr);
     std.posix.munmap(p[0..aligned_size]);
 }
@@ -1911,10 +2001,10 @@ pub fn protectMemory(addr: *anyopaque, size: usize, prot: u32) !void {
     if (builtin.os.tag == .windows) return error.Unsupported;
     if (size == 0) return error.InvalidSize;
     const base_addr = @intFromPtr(addr);
-    const aligned_addr = mem.alignBackward(usize, base_addr, PageSize);
+    const aligned_addr = alignBackwardUnchecked(base_addr, PageSize);
     const delta = base_addr - aligned_addr;
     const span = try addChecked(size, delta);
-    const aligned_size = mem.alignForward(usize, span, PageSize);
+    const aligned_size = try alignForwardChecked(span, PageSize);
     const p: [*]align(PageSize) u8 = @ptrFromInt(aligned_addr);
     try std.posix.mprotect(p[0..aligned_size], prot);
 }
@@ -1923,10 +2013,10 @@ pub fn lockMemory(addr: *anyopaque, size: usize) !void {
     if (builtin.os.tag == .windows) return error.Unsupported;
     if (size == 0) return error.InvalidSize;
     const base_addr = @intFromPtr(addr);
-    const aligned_addr = mem.alignBackward(usize, base_addr, PageSize);
+    const aligned_addr = alignBackwardUnchecked(base_addr, PageSize);
     const delta = base_addr - aligned_addr;
     const span = try addChecked(size, delta);
-    const aligned_size = mem.alignForward(usize, span, PageSize);
+    const aligned_size = try alignForwardChecked(span, PageSize);
     const p: [*]align(PageSize) u8 = @ptrFromInt(aligned_addr);
     if (builtin.os.tag != .linux) return error.Unsupported;
     const rc = std.os.linux.syscall2(.mlock, @intFromPtr(p), aligned_size);
@@ -1937,10 +2027,10 @@ pub fn unlockMemory(addr: *anyopaque, size: usize) !void {
     if (builtin.os.tag == .windows) return error.Unsupported;
     if (size == 0) return;
     const base_addr = @intFromPtr(addr);
-    const aligned_addr = mem.alignBackward(usize, base_addr, PageSize);
+    const aligned_addr = alignBackwardUnchecked(base_addr, PageSize);
     const delta = base_addr - aligned_addr;
     const span = try addChecked(size, delta);
-    const aligned_size = mem.alignForward(usize, span, PageSize);
+    const aligned_size = try alignForwardChecked(span, PageSize);
     const p: [*]align(PageSize) u8 = @ptrFromInt(aligned_addr);
     if (builtin.os.tag != .linux) return error.Unsupported;
     const rc = std.os.linux.syscall2(.munlock, @intFromPtr(p), aligned_size);
@@ -1951,10 +2041,10 @@ pub fn adviseMemory(addr: *anyopaque, size: usize, advice: u32) !void {
     if (builtin.os.tag == .windows) return error.Unsupported;
     if (size == 0) return error.InvalidSize;
     const base_addr = @intFromPtr(addr);
-    const aligned_addr = mem.alignBackward(usize, base_addr, PageSize);
+    const aligned_addr = alignBackwardUnchecked(base_addr, PageSize);
     const delta = base_addr - aligned_addr;
     const span = try addChecked(size, delta);
-    const aligned_size = mem.alignForward(usize, span, PageSize);
+    const aligned_size = try alignForwardChecked(span, PageSize);
     const p: [*]align(PageSize) u8 = @ptrFromInt(aligned_addr);
     try std.posix.madvise(p, aligned_size, advice);
 }
@@ -2134,7 +2224,7 @@ pub const EncryptedStorage = struct {
 
 pub fn memoryAlign(ptr: *anyopaque, alignment: usize) !*anyopaque {
     if (!isPow2(alignment)) return error.InvalidAlignment;
-    return @ptrFromInt(mem.alignForward(usize, @intFromPtr(ptr), alignment));
+    return @ptrFromInt(try alignForwardChecked(@intFromPtr(ptr), alignment));
 }
 
 pub fn isMemoryOverlap(a_start: *const anyopaque, a_size: usize, b_start: *const anyopaque, b_size: usize) !bool {
@@ -2147,7 +2237,8 @@ pub fn isMemoryOverlap(a_start: *const anyopaque, a_size: usize, b_start: *const
 
 pub fn copyNonOverlapping(dest: []u8, src: []const u8) !void {
     if (dest.len != src.len) return error.SizeMismatch;
-    if (try isMemoryOverlap(dest.ptr, dest.len, src.ptr, src.len)) return error.Overlap;
+    if (dest.len == 0) return;
+    if (try isMemoryOverlap(@as(*const anyopaque, @ptrCast(dest.ptr)), dest.len, @as(*const anyopaque, @ptrCast(src.ptr)), src.len)) return error.Overlap;
     @memcpy(dest, src);
 }
 
@@ -2238,10 +2329,10 @@ test "ArenaAllocator basic allocation" {
 }
 
 test "zero copy transfer" {
-    var src = [_]u8{ 1, 2, 3, 4, 5 };
+    const src = [_]u8{ 1, 2, 3, 4, 5 };
     var dest: [5]u8 = undefined;
-    zeroCopyTransfer(&src, &dest);
-    try testing.expectEqualSlices(u8, &src, &dest);
+    zeroCopyTransfer(src[0..], dest[0..]);
+    try testing.expectEqualSlices(u8, src[0..], dest[0..]);
 }
 
 test "memory hashing" {
@@ -2315,6 +2406,7 @@ test "LockFreeQueue" {
     var queue = try LockFreeQueue.init(testing.allocator, 16);
     defer queue.deinit();
     var item: usize = 42;
+    item += 0;
     try testing.expect(queue.enqueue(@as(*anyopaque, @ptrCast(&item))));
     const retrieved = queue.dequeue();
     try testing.expect(retrieved != null);
@@ -2325,6 +2417,7 @@ test "LockFreeStack" {
     var stack = LockFreeStack.init(testing.allocator);
     defer stack.deinit();
     var item: usize = 42;
+    item += 0;
     try stack.push(@as(*anyopaque, @ptrCast(&item)));
     const retrieved = stack.pop();
     try testing.expect(retrieved != null);
